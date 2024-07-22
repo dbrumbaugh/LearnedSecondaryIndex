@@ -16,3 +16,6 @@
 [submodule "external/learnedhashing"]
 	path = external/learnedhashing
 	url = https://github.com/DominikHorn/learned-hashing.git
+[submodule "external/pgm"]
+	path = external/pgm
+	url = https://github.com/gvinciguerra/PGM-index.git

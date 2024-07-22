@@ -12,6 +12,9 @@
 #include "include/util/fingerprinter.hpp"
 #include "util/permvector.hpp"
 
+#include "storage/LogStorage.h"
+#include "storage/LogStorageIterator.h"
+
 namespace learned_secondary_index {
 
 /**
@@ -24,10 +27,11 @@ namespace learned_secondary_index {
  * vector. Choose large enough to fit data.size()! Should become irrelevant in
  * the future due to bitpacking etc.
  */
-template <class Key,
-          class Model = learned_hashing::RadixSplineHash<Key, 18, 16>,
+template <class Rec,
+          class Model = learned_hashing::RadixSplineHash<decltype(Rec::key), 18, 16>,
           std::uint8_t fingerprint_size = 0, bool force_linear_search = false>
 class LearnedSecondaryIndex {
+  typedef decltype(Rec::key) Key;
   util::PermVector<util::Fingerprinter<Key, fingerprint_size>> _perm_vector;
   Model _model;
   size_t max_error = 0;
@@ -36,6 +40,8 @@ class LearnedSecondaryIndex {
 
   size_t _base_data_accesses = 0;
   size_t _false_positive_accesses = 0;
+
+  dlsi::LogStorage<Rec> *_storage;
 
  public:
   /// Speeds up permutation and model build
@@ -123,7 +129,7 @@ class LearnedSecondaryIndex {
       return a._iter != b._iter;
     };
 
-    friend LearnedSecondaryIndex<Key, Model, fingerprint_size,
+    friend LearnedSecondaryIndex<Rec, Model, fingerprint_size,
                                  force_linear_search>;
   };
 
@@ -131,9 +137,9 @@ class LearnedSecondaryIndex {
   /// Constructs an empty index
   LearnedSecondaryIndex() noexcept = default;
 
-  template <class It>
-  LearnedSecondaryIndex(const It &begin, const It &end) {
-    fit(begin, end);
+  LearnedSecondaryIndex(typename dlsi::LogStorage<Rec>::Iterator iter, dlsi::LogStorage<Rec> *ls) {
+    _storage = ls;
+    fit(std::move(iter));
   }
 
   /**
@@ -145,16 +151,15 @@ class LearnedSecondaryIndex {
    * @param begin start of data to index
    * @param end start of data to index
    */
-  template <class It>
-  void fit(const It &begin, const It &end) {
-    const auto n = std::distance(begin, end);
+  void fit(typename dlsi::LogStorage<Rec>::Iterator iter) {
+    const auto n = iter->record_count();
 
     // retain original displacement for each key to build permutations vector
     DisplacementVector data;
     data.reserve(n);
     size_t i = 0;
-    for (auto it = begin; it < end; it++) {
-      data.push_back(std::make_pair(*it, i++));
+    while (iter->next()) {
+      data.push_back(std::make_pair(iter->get().key, i++));
     }
 
     // sort data
@@ -270,7 +275,7 @@ class LearnedSecondaryIndex {
       return a._index != b._index || a._perm_vector != b._perm_vector;
     };
 
-    friend LearnedSecondaryIndex<Key, Model, fingerprint_size,
+    friend LearnedSecondaryIndex<Rec, Model, fingerprint_size,
                                  force_linear_search>;
   };
 
@@ -296,8 +301,8 @@ class LearnedSecondaryIndex {
    * the first entry not less than key may be found or end() if all keys are
    * smaller
    */
-  template <bool lowerbound, class It>
-  PermIter lookup(const It &begin, const It &end, const Key &key) const {
+  template <bool lowerbound>
+  PermIter lookup(const Key &key) const {
     const auto incr_false_positives = [&]() {
       // false_positive_accesses is a debug variable, only attached to LSI for
       // convenience/to not break the interface (const). Don't do this
@@ -327,6 +332,8 @@ class LearnedSecondaryIndex {
     auto stop_i = std::min(pred + max_error + 1, _perm_vector.size());
     const auto stop = this->begin() + stop_i;
 
+    Rec tmp;
+
     if constexpr (force_linear_search || fingerprint_size > 0) {
       PermIter ind(start_i, _perm_vector);
 
@@ -337,24 +344,29 @@ class LearnedSecondaryIndex {
         // use fingerprint bits to fast track non-hits.
         if constexpr (!lowerbound) {
           if (!_perm_vector.test(key, perm_val)) {
-            assert(*(begin + perm_val.index) != key);
+            _storage->read_record(perm_val.index, tmp);
+            assert(tmp.key != key);
             continue;
           }
         }
 
         // access base data to see if we may stop
         incr_base_accesses();
-        if (*(begin + perm_val.index) >= key) break;
+        _storage->read_record(perm_val.index, tmp);
+        if (tmp.key >= key) break;
         incr_false_positives();
       }
 
       if constexpr (lowerbound) {
-        while (ind != this->end() && *(begin + *ind) < key) {
+        while (ind != this->end()) {
+          _storage->read_record(*ind, tmp);
+          if (tmp.key >= key) break;
           incr_base_accesses();
           ind++;
         }
       } else {
-        if (*(begin + *ind) != key) {
+        _storage->read_record(*ind, tmp);
+        if (tmp.key != key) {
           return this->end();
         }
       }
@@ -366,9 +378,9 @@ class LearnedSecondaryIndex {
         // probe key at mid
         const auto mid_i = start_i + (stop_i - start_i) / 2;
         incr_base_accesses();
-        const auto probed = *(begin + _perm_vector[mid_i].index);
+        _storage->read_record(_perm_vector[mid_i].index, tmp);
 
-        if (probed < key) {
+        if (tmp.key < key) {
           start_i = mid_i + 1;
         } else {
           stop_i = mid_i;
@@ -378,13 +390,17 @@ class LearnedSecondaryIndex {
       PermIter ind(start_i, _perm_vector);
 
       if constexpr (lowerbound) {
-        while (ind != this->end() && *(begin + *ind) < key) {
+        while (ind != this->end()) { //} && *(begin + *ind) < key) {
+          _storage->read_record(*ind, tmp);
+          if (tmp.key >= key) break;
+
           incr_base_accesses();
           ind++;
         }
       } else {
-        if (*(begin + *ind) != key) {
-          return this->end();
+        _storage->read_record(*ind, tmp);
+        if (tmp.key != key) {
+            return this->end();
         }
       }
 
